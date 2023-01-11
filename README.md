@@ -1,2 +1,3 @@
-# Gemini-GNU-Linux
+# Gemini GNU/Linux
+
 The Files of my Linux Distro
