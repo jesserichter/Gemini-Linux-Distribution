@@ -1,0 +1,1620 @@
+#!/bin/bash
+set -uo pipefail
+
+
+################################################
+# Initialize script environment
+
+# Find the directory this script is stored in. (from: http://stackoverflow.com/questions/59895)
+function get_source_dir() {
+	local source="${BASH_SOURCE[0]}"
+	while [[ -h $source ]]; do
+		local tmp
+		tmp="$(cd -P "$(dirname "${source}")" && pwd)"
+		source="$(readlink "${source}")"
+		[[ $source != /* ]] && source="${tmp}/${source}"
+	done
+
+	echo -n "$(realpath "$(dirname "${source}")")"
+}
+
+GENTOO_INSTALL_REPO_DIR="$(get_source_dir)"
+export GENTOO_INSTALL_REPO_DIR
+export GENTOO_INSTALL_REPO_SCRIPT_ACTIVE=true
+
+# shellcheck source=./scripts/utils.sh
+source "$GENTOO_INSTALL_REPO_DIR/scripts/utils.sh"
+
+# Remember actual config file path
+CONFIG_FILE="$(realpath "${1-"gentoo.conf"}" 2>/dev/null)"
+RELA_CONFIG_FILE="$(realpath --relative-to="$(pwd)" "$CONFIG_FILE" 2>/dev/null)"
+
+# Check if help is requested
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		""|"help"|"--help"|"-help"|"-h")
+			echo "Usage: $0 [config]"
+			echo "Starts the gentoo configurator. If no file is given, it defaults to 'gentoo.conf'."
+			echo "If the file doesn't exist, the configurator loads default values, otherwise, the"
+			echo "the configuration is loaded into the configurator."
+			exit 0
+			;;
+	esac
+	shift
+done
+
+check_wanted_programs dialog ncurses=ncursesw6-config
+
+# Determine whether EFI is available
+HAS_EFI_SUPPORT=$([[ -d /sys/firmware/efi ]] && echo -n "true" || echo -n "false")
+DEFAULT_BOOT_TYPE=$([[ $HAS_EFI_SUPPORT == true ]] && echo -n "efi" || echo -n "bios")
+EFI_UNSUPPORTED_MESSAGE_SHORT="Missing EFI support on this system!"
+EFI_UNSUPPORTED_MESSAGE="Apparently, your system does NOT support efi. Double-check before proceeding!"
+
+# Wrap dialog in two functions to prevent it from cluttering stderr.
+function dialog_wrapper() { dialog_out=$(command dialog --colors "$@" 3>&2 2>&1 1>&3 3>&-); }
+function dialog() { dialog_wrapper "$@" 2>&1; }
+
+
+################################################
+# Configuration helper functions
+
+function get_timezone() {
+	local file
+	if file="$(readlink /etc/localtime)"; then
+		# /etc/localtime is a symlink as expected
+		local timezone
+		timezone=${file#*zoneinfo/}
+		if [[ $timezone == "$file" ]]; then
+			# not pointing to expected location or not Region/City
+			echo "Europe/London"
+		else
+			echo "$timezone"
+		fi
+	else
+		# compare files by contents
+		find /usr/share/zoneinfo -type f -exec cmp -s {} /etc/localtime \; -print \
+			| sed -e 's,.*/zoneinfo/,,' \
+			| head -1
+	fi
+}
+
+function get_default_keymap() {
+	local keymap
+	keymap="$(grep KEYMAP /etc/vconsole.conf 2>/dev/null || echo "KEYMAP=us")"
+	keymap="${keymap#KEYMAP=}"
+
+	local map
+	for map in "${ALL_KEYMAPS[@]}"; do
+		if [[ $map == "$keymap" ]]; then
+			echo -n "${keymap}"
+			return
+		fi
+	done
+
+	# Fallback to us
+	echo -n "us"
+}
+
+function get_all_keymaps() {
+	ALL_KEYMAPS=()
+	local map
+	for map in $(find /usr/share/keymaps/ /usr/share/kbd/keymaps/ -type f -iname '*.map.gz' -printf "%f\n" 2>/dev/null | sort -u); do
+		ALL_KEYMAPS+=("${map%%.map.gz}")
+	done
+}
+
+function get_all_timezones() {
+	readarray -t ALL_TIMEZONES < <(find /usr/share/zoneinfo -type f -printf "%P\n" | sort -u)
+}
+
+function recalculate_locales() {
+	LOCALES=""
+	N_LOCALES=0
+
+	local selected_index_list="$SELECTED_LOCALES"
+	local next_selected
+	next_selected="${selected_index_list%% *}"
+	selected_index_list="${selected_index_list#* }"
+
+	local i=0
+	for item in "${SUPPORTED_LOCALES[@]}"; do
+		if [[ "$i" == "$next_selected" ]]; then
+			LOCALES="$LOCALES"$'\n'"$item"
+			next_selected="${selected_index_list%% *}"
+			selected_index_list="${selected_index_list#* }"
+			((++N_LOCALES))
+		fi
+		((++i))
+	done
+
+	LOCALES="${LOCALES:1}"
+}
+
+function define_disk_configuration_function() {
+	cat << EOF
+function disk_configuration() {
+	$* ;
+}
+EOF
+}
+
+function define_swap() {
+	if [[ $PARTITIONING_USE_SWAP == "true" ]]; then
+		echo -n "${PARTITIONING_SWAP@Q}"
+	else
+		echo -n "false"
+	fi
+}
+
+function define_zfs_compression() {
+	if [[ $PARTITIONING_ZFS_USE_COMPRESSION != "false" ]]; then
+		echo -n "${PARTITIONING_ZFS_COMPRESSION@Q}"
+	else
+		echo -n "false"
+	fi
+}
+
+function define_disk_layout() {
+	local swapdev
+	case "$PARTITIONING_SCHEME" in
+		"classic_single_disk") define_disk_configuration_function "create_classic_single_disk_layout swap=$(define_swap) type=${PARTITIONING_BOOT_TYPE@Q} luks=${PARTITIONING_USE_LUKS@Q} root_fs=${PARTITIONING_ROOT_FS@Q}" "${PARTITIONING_DEVICE@Q}" ;;
+		"existing_partitions")
+			if [[ "$PARTITIONING_USE_SWAP" ]]; then
+				swapdev=${PARTITIONING_SWAP_DEVICE:-false}
+			else
+				swapdev=false
+			fi
+		    define_disk_configuration_function "create_existing_partitions_layout boot=${PARTITIONING_BOOT_DEVICE@Q} swap=${swapdev@Q} type=${PARTITIONING_BOOT_TYPE@Q}" "${PARTITIONING_DEVICE@Q}" ;;
+		"zfs_centric")         define_disk_configuration_function "create_zfs_centric_layout swap=$(define_swap) type=${PARTITIONING_BOOT_TYPE@Q} encrypt=${PARTITIONING_ZFS_USE_ENCRYPTION@Q} compress=$(define_zfs_compression) pool_type=${PARTITIONING_ZFS_POOL_TYPE@Q}" "${PARTITIONING_DEVICES[@]@Q}" ;;
+		"btrfs_centric")       define_disk_configuration_function "create_btrfs_centric_layout swap=$(define_swap) type=${PARTITIONING_BOOT_TYPE@Q} raid_type=${PARTITIONING_BTRFS_RAID_TYPE@Q} luks=${PARTITIONING_USE_LUKS@Q}" "${PARTITIONING_DEVICES[@]@Q}" ;;
+		"raid0_luks")          define_disk_configuration_function "create_raid0_luks_layout swap=$(define_swap) type=${PARTITIONING_BOOT_TYPE@Q} root_fs=${PARTITIONING_ROOT_FS@Q}" "${PARTITIONING_DEVICES[@]@Q}" ;;
+		"custom")
+			# Show current function declaration, trim trailing whitespace
+			declare -f disk_configuration \
+				| sed -e 's/\s*$//'
+			;;
+	esac
+}
+
+ALL_GENTOO_ARCHS=("x86" "amd64" "arm" "arm64")
+ALL_STAGE3_VARIANTS=(
+	"openrc"                              "openrc                             | Minimal OpenRC base (recommended)"
+	"desktop-openrc"                      "openrc-desktop                     | OpenRC, desktop profile, might have blockers"
+	"systemd"                             "systemd                            | Minimal systemd base (recommended)"
+	"systemd-mergedusr"                   "systemd-mergedusr                  | Minimal systemd base with merged filesystem layout"
+	"desktop-systemd"                     "systemd-desktop                    | systemd, desktop profile, might have blockers"
+	"nomultilib-openrc"                   "nomultilib-openrc                  | Minimal OpenRC base without 32bits support (Experimental)"
+	"nomultilib-systemd"                  "nomultilib-systemd                 | Minimal systemd base without 32bits support (Experimental)"
+	"nomultilib-systemd-mergedusr"        "nomultilib-systemd-mergedusr       | Minimal systemd base with merged filesystem layout and without 32bits support (Experimental)"
+	"x32-openrc"                          "x32-openrc                         | Minimal OpenRC base without 64bits support (Experimental)"
+	"x32-systemd"                         "x32-systemd                        | Minimal systemd base without 64bits support (Experimental)"
+	"x32-systemd-mergedusr"               "x32-systemd-mergedusr              | Minimal systemd base with merged filesystem layout and without 64bits support (Experimental)"
+	"llvm-openrc"                         "llvm-openrc                        | Minimal OpenRC base compiled with LLVM (Experimental)"
+	"llvm-systemd"                        "llvm-systemd                       | Minimal systemd base compiled with LLVM (Experimental)"
+	"llvm-systemd-mergedusr"              "llvm-systemd-mergedusr             | Minimal systemd base with merged filesystem layout compiled with LLVM (Experimental)"
+	"hardened-openrc"                     "hardened-openrc                    | Hardened OpenRC base (Experimental)"
+	"hardened-nomultilib-openrc"          "hardened-nomultilib-openrc         | Hardened OpenRC base without 32bits support (Experimental)"
+	"hardened-selinux-openrc"             "hardened-selinux-openrc            | Hardened OpenRC base with SELinux (Experimental)"
+	"hardened-nomultilib-selinux-openrc"  "hardened-nomultilib-selinux-openrc | Hardened OpenRC base with SELinux and without 32bits support (Experimental)"
+	"musl"                                "musl-openrc                        | Minimal OpenRC base using musl (Experimental)"
+	"musl-llvm"                           "musl-llvm-openrc                   | Minimal OpenRC base using musl compiled with LLVM (Experimental)"
+	"musl-hardened"                       "musl-hardened-openrc               | Hardened OpenRC base using musl (Experimental)"
+)
+
+ALL_PARTITIONING_SCHEMES=(
+	"classic_single_disk" "Classic single disk layout (boot/efi, swap?, root)"
+	"existing_partitions" "Skip partitioning, use existing pre-formatted partitions"
+	"zfs_centric"         "ZFS centric (optional ZFS compression and encryption)"
+	"btrfs_centric"       "Btrfs centric (optional raid0/1 via btrfs)"
+	"raid0_luks"          "Raid0 (N>=2 disks) and luks for root"
+	"custom"              "Custom (expert option; edit the config manually later)"
+)
+
+PARTITIONING_BOOT_TYPES=(
+	"efi" "efi$([[ $HAS_EFI_SUPPORT == true ]] && echo -n "" || echo -n " (!! $EFI_UNSUPPORTED_MESSAGE_SHORT !!)")"
+	"bios" "bios"
+)
+PARTITIONING_ROOT_FS_TYPES=("ext4" "btrfs")
+PARTITIONING_BTRFS_RAID_TYPES=("raid0" "raid1")
+PARTITIONING_ZFS_POOL_TYPES=("standard" "custom")
+PARTITIONING_ZFS_COMPRESSIONS=("on" "gzip" "lz4" "lzjb" "zle" "zstd" "zstd-fast")
+
+PORTAGE_SYNC_TYPES=("git" "rsync")
+
+function create_single_disk_layout() {
+	create_classic_single_disk_layout "$@"
+}
+
+function parse_swap() {
+	if [[ $1 == "false" ]]; then
+		PARTITIONING_USE_SWAP=false
+		PARTITIONING_SWAP=8GiB
+	else
+		PARTITIONING_USE_SWAP=true
+		PARTITIONING_SWAP="$1"
+	fi
+}
+
+function parse_zfs_compression() {
+	if [[ $1 == "false" ]]; then
+		PARTITIONING_ZFS_USE_COMPRESSION=false
+		PARTITIONING_ZFS_COMPRESSION=zstd
+	else
+		PARTITIONING_ZFS_USE_COMPRESSION=true
+		PARTITIONING_ZFS_COMPRESSION="$1"
+	fi
+}
+
+function create_classic_single_disk_layout() {
+	PARTITIONING_SCHEME="classic_single_disk"
+
+	local known_arguments=('+swap' '?type' '?luks' '?root_fs')
+	local extra_arguments=()
+	declare -A arguments; parse_arguments "$@"
+
+	PARTITIONING_DEVICE="${extra_arguments[0]}"
+	parse_swap "${arguments[swap]}"
+	PARTITIONING_BOOT_TYPE="${arguments[type]}"
+	PARTITIONING_USE_LUKS="${arguments[luks]:-false}"
+	PARTITIONING_ROOT_FS="${arguments[root_fs]:-ext4}"
+}
+
+function create_existing_partitions_layout() {
+	PARTITIONING_SCHEME="existing_partitions"
+
+	local known_arguments=('+swap' '+boot' '?type')
+	local extra_arguments=()
+	declare -A arguments; parse_arguments "$@"
+
+	PARTITIONING_DEVICE="${extra_arguments[0]}"
+	if [[ "${arguments[swap]}" == "false" ]]; then
+		PARTITIONING_USE_SWAP=false
+		PARTITIONING_SWAP_DEVICE=""
+	else
+		PARTITIONING_USE_SWAP=true
+		PARTITIONING_SWAP_DEVICE="${arguments[swap]}"
+	fi
+	PARTITIONING_BOOT_TYPE="${arguments[type]}"
+	PARTITIONING_BOOT_DEVICE="${arguments[boot]}"
+}
+
+function create_raid0_luks_layout() {
+	PARTITIONING_SCHEME="raid0_luks"
+
+	local known_arguments=('+swap' '?type' '?root_fs')
+	local extra_arguments=()
+	declare -A arguments; parse_arguments "$@"
+
+	PARTITIONING_DEVICES=("${extra_arguments[@]}")
+	parse_swap "${arguments[swap]}"
+	PARTITIONING_BOOT_TYPE="${arguments[type]}"
+	PARTITIONING_ROOT_FS="${arguments[root_fs]:-ext4}"
+}
+
+function create_zfs_centric_layout() {
+	PARTITIONING_SCHEME="zfs_centric"
+
+	local known_arguments=('+swap' '?type' '?pool_type' '?encrypt' '?compress')
+	local extra_arguments=()
+	declare -A arguments; parse_arguments "$@"
+
+	PARTITIONING_DEVICES=("${extra_arguments[@]}")
+	parse_swap "${arguments[swap]}"
+	PARTITIONING_BOOT_TYPE="${arguments[type]}"
+	PARTITIONING_ZFS_POOL_TYPE="${arguments[pool_type]:-standard}"
+	PARTITIONING_ZFS_USE_ENCRYPTION="${arguments[encrypt]:-false}"
+	parse_zfs_compression "${arguments[compress]:-false}"
+}
+
+function create_btrfs_raid_layout() {
+	create_btrfs_centric_layout "$@"
+}
+
+function create_btrfs_centric_layout() {
+	PARTITIONING_SCHEME="btrfs_centric"
+
+	# shellcheck disable=SC2034
+	local known_arguments=('+swap' '?type' '?raid_type' '?luks')
+	local extra_arguments=()
+	declare -A arguments; parse_arguments "$@"
+
+	PARTITIONING_DEVICES=("${extra_arguments[@]}")
+	parse_swap "${arguments[swap]}"
+	PARTITIONING_BOOT_TYPE="${arguments[type]}"
+	PARTITIONING_USE_LUKS="${arguments[luks]:-false}"
+	PARTITIONING_BTRFS_RAID_TYPE="${arguments[raid_type]:-raid0}"
+}
+
+
+################################################
+# Configuration constants
+
+get_all_keymaps
+get_all_timezones
+readarray -t SUPPORTED_LOCALES < "$GENTOO_INSTALL_REPO_DIR/contrib/i18n_supported"
+readarray -t LOCALE_A < <(locale -a)
+
+
+################################################
+# Load/Default configuration
+
+function load_selected_locales() {
+	local sel_locales=()
+	local IFS=$'\n'
+	declare -A selected_by_name
+	for i in $LOCALES; do
+		selected_by_name["$i"]=true
+	done
+
+	local i=0
+	for item in "${SUPPORTED_LOCALES[@]}"; do
+		[[ "${selected_by_name[$item]:-}" == true ]] \
+			&& sel_locales+=("$i")
+		((++i))
+	done
+
+	local IFS=" "
+	SELECTED_LOCALES="${sel_locales[*]}"
+}
+
+function process_config() {
+	disk_configuration
+
+	if [[ "$KEYMAP" == "$KEYMAP_INITRAMFS" ]]; then
+		KEYMAP_INITRAMFS_OTHER=false
+	else
+		KEYMAP_INITRAMFS_OTHER=true
+	fi
+
+	load_selected_locales
+	recalculate_locales
+}
+
+function load_config() {
+	# First load defaults, then replace by sourcing config.
+	load_default_config
+
+	# Fallback to custom partitioning scheme if it isn't set in the actual config
+	PARTITIONING_SCHEME="custom"
+
+	# Load settings
+	# shellcheck disable=SC1090
+	source "$1" || die "Could not load given configuration."
+
+	# After loading a config no unsaved changes exist.
+	UNSAVED_CHANGES=false
+}
+
+function load_default_config() {
+	HOSTNAME="gentoo"
+	TIMEZONE="$(get_timezone)"
+	KEYMAP="$(get_default_keymap)"
+	KEYMAP_INITRAMFS="$KEYMAP"
+	LOCALES="C.UTF-8 UTF-8"
+	LOCALE="C.utf8"
+
+	SYSTEMD_NETWORKD=true
+	SYSTEMD_NETWORKD_INTERFACE_NAME="en*"
+	SYSTEMD_NETWORKD_DHCP=true
+	SYSTEMD_NETWORKD_ADDRESSES=("192.168.1.100/32" "fd00::1/64")
+	SYSTEMD_NETWORKD_GATEWAY="192.168.1.1"
+	SYSTEMD_INITRAMFS_SSHD=false
+
+	function disk_configuration() {
+		#create_zfs_centric_layout swap=8GiB type="$DEFAULT_BOOT_TYPE" encrypt=true compress=zstd pool_type=standard /dev/sdX
+		create_classic_single_disk_layout swap=8GiB type="$DEFAULT_BOOT_TYPE" luks=true root_fs=ext4 /dev/sdX
+	}
+
+	STAGE3_VARIANT="systemd"
+	PORTAGE_SYNC_TYPE="git"
+	PORTAGE_GIT_FULL_HISTORY=false
+	PORTAGE_GIT_MIRROR="https://anongit.gentoo.org/git/repo/sync/gentoo.git"
+
+	GENTOO_MIRROR="https://mirror.eu.oneandone.net/linux/distributions/gentoo/gentoo"
+	GENTOO_ARCH="amd64"
+
+	USE_PORTAGE_TESTING=true
+	SELECT_MIRRORS=false
+	SELECT_MIRRORS_LARGE_FILE=false
+
+	ADDITIONAL_PACKAGES=()
+	ENABLE_SSHD=true
+	ROOT_SSH_AUTHORIZED_KEYS=""
+
+	# All settings are unsaved.
+	UNSAVED_CHANGES=true
+}
+
+SAVE_AS_FILENAME="$RELA_CONFIG_FILE"
+if [[ -e "$CONFIG_FILE" ]]; then
+	load_config "$CONFIG_FILE"
+else
+	load_default_config
+fi
+process_config
+
+
+################################################
+# Menu helpers and constants
+
+# $1: exit code
+function clear_and_exit() {
+	dialog --clear
+	clear -x
+	exit "$1"
+}
+
+function ellipsis() {
+	local len="$1"
+	shift
+	local str="$*"
+	if [[ "${#str}" -gt "$len" ]]; then
+		echo "${str:0:$len}…"
+	else
+		echo "$str"
+	fi
+}
+
+function on_off_toggle() {
+	if [[ "${!1}" == true ]]; then
+		declare -g "$1"=false
+	else
+		declare -g "$1"=true
+	fi
+}
+
+function on_off_str() {
+	if [[ "$1" == true ]]; then
+		echo -n "$2"
+	else
+		echo -n "$3"
+	fi
+}
+
+function on_off_label() {
+	local prefix="${2:-}"
+	on_off_str "$1" "${prefix}[*]" "${prefix}[ ]"
+}
+
+function on_off_label_inverted() {
+	local var=$1
+	shift
+	on_off_label "$(is_on "$var" && echo false || echo true)" "$@"
+}
+
+function is_on() {
+	[[ "$1" == true ]]
+}
+
+function is_off() {
+	[[ "$1" != true ]]
+}
+
+# if $1 is in $2..
+function one_of() {
+	local what="$1"
+	shift
+	for i in "$@"; do
+		[[ "$i" == "$what" ]] \
+			&& return 0
+	done
+	return 1
+}
+
+# $1: title
+# $2: description
+# $3: space separated index list of selected items (e.g. "0 1 5 6")
+# $@: all items
+function menu_splitlist() {
+	local title="$1"
+	local description="$2"
+	local selected_index_list="$3"
+	shift 3
+
+	# Build option array
+	local items=()
+	local item
+	local i=0
+	local next_selected="${selected_index_list%% *}"
+	local selected_index_list="${selected_index_list#* }"
+	for item in "$@"; do
+		if [[ "$i" == "$next_selected" ]]; then
+			items+=("$i" "$item" "on")
+			next_selected="${selected_index_list%% *}"
+			selected_index_list="${selected_index_list#* }"
+		else
+			items+=("$i" "$item" "off")
+		fi
+		((++i))
+	done
+
+	# Show selection dialog
+	dialog \
+		--title "$title" \
+		--buildlist "$description\nUse ^ to focus the list of unselected items and $ to focus the list of selected items. Use <Space> to select/deselect an item and select <OK> by pressing <Enter> when finished." \
+		"${BUILDLIST_SIZE[@]}" "${items[@]}"
+
+	local diag_exit=$?
+	if [[ $diag_exit == 0 ]]; then
+		# <OK>
+		return 0
+	elif [[ $diag_exit == 1 ]]; then
+		# <Cancel>
+		return 1
+	else
+		# <ESC><ESC>
+		return 1
+	fi
+}
+
+# $1: title
+# $2: description
+# $3: default item
+# $@: [tag label]...
+function menu_radiolist_labeled() {
+	local title="$1"
+	local description="$2"
+	local default_item="$3"
+	shift 3
+
+	# Build option array
+	local items=()
+	local tag
+	local label
+	while [[ "$#" -gt 0 ]]; do
+		tag="$1"
+		label="$2"
+		shift 2
+
+		if [[ $tag == "$default_item" ]]; then
+			items+=("$tag" "$label" "on")
+		else
+			items+=("$tag" "$label" "off")
+		fi
+	done
+
+	# Show selection dialog
+	dialog \
+		--no-tags \
+		--title "$title" \
+		--help-button \
+		--help-label "Select" \
+		--help-status \
+		--ok-label "OK" \
+		--default-item "$default_item" \
+		--default-button help \
+		--radiolist "$description\nUse <Select> to select the option under the cursor, or <OK> to use the option which is selected with an asterisk." \
+		"${RADIOLIST_SIZE[@]}" "${items[@]}"
+
+	local diag_exit=$?
+	if [[ $diag_exit == 0 ]]; then
+		# <OK>
+		return 0
+	elif [[ $diag_exit == 1 ]]; then
+		# <Cancel>
+		return 1
+	elif [[ $diag_exit == 2 ]]; then
+		# <Select>
+		local sel="${dialog_out#HELP }"
+		local sel_cur="${sel% *}"
+		#local sel_radio="${sel#* }"
+		dialog_out="$sel_cur"
+		return 0
+	else
+		# <ESC><ESC>
+		return 1
+	fi
+}
+
+# $1: title
+# $2: description
+# $3: default item
+# $@: items
+function menu_radiolist() {
+	local title="$1"
+	local description="$2"
+	local default_item="$3"
+	shift 3
+
+	# Build option array
+	local items=()
+	local item
+	for item in "$@"; do
+		if [[ $item == "$default_item" ]]; then
+			items+=("$item" "on")
+		else
+			items+=("$item" "off")
+		fi
+	done
+
+	# Show selection dialog
+	dialog \
+		--no-items \
+		--title "$title" \
+		--help-button \
+		--help-label "Select" \
+		--help-status \
+		--ok-label "OK" \
+		--default-item "$default_item" \
+		--default-button help \
+		--radiolist "$description\nUse <Select> to select the option under the cursor, or <OK> to use the option which is selected with an asterisk." \
+		"${RADIOLIST_SIZE[@]}" "${items[@]}"
+
+	local diag_exit="$?"
+	if [[ $diag_exit == 0 ]]; then
+		# <OK>
+		return 0
+	elif [[ $diag_exit == 1 ]]; then
+		# <Cancel>
+		return 1
+	elif [[ $diag_exit == 2 ]]; then
+		# <Select>
+		local sel="${dialog_out#HELP }"
+		local sel_cur="${sel% *}"
+		#local sel_radio="${sel#* }"
+		dialog_out="$sel_cur"
+		return 0
+	else
+		# <ESC><ESC>
+		return 1
+	fi
+}
+
+# $1: title
+# $2: description
+# $3: current device (will be canonicalized if possible)
+function menu_select_device() {
+	local title="$1"
+	local desc="$2"
+	local prev_selected
+	prev_selected=$(canonicalize_device "$3")
+
+	while true; do
+		local all_devices=()
+		for dev in /dev/disk/by-id/*; do
+			all_devices+=("$dev" "$(basename "$dev")")
+		done
+		all_devices+=("/dev/null" "<enter custom path>")
+
+		if menu_radiolist_labeled "$title" "$desc" "$prev_selected" "${all_devices[@]}"; then
+			if [[ "$dialog_out" == "/dev/null" ]]; then
+				while true; do
+					if dialog \
+						--title "$1" \
+						--inputbox "$([[ -e $prev_selected ]] || echo -n "\Z1The previously selected device $prev_selected does not exist!\Zn ")Enter the path of the desired device." \
+						"${INPUTBOX_SIZE[@]}" "$prev_selected"
+					then
+						# Repeat until selected device exists or cancelled
+						prev_selected="$dialog_out"
+						[[ ! -e "$dialog_out" ]] && continue
+						return 0
+					else
+						# <Cancel> -> return to previous menu
+						break
+					fi
+				done
+
+				# Return to radiolist
+				continue
+			else
+				return 0
+			fi
+		else
+			# <Cancel>
+			return 1
+		fi
+	done
+}
+
+function msgbox_help() {
+	dialog --msgbox "$1" "${HELP_POPUP_SIZE[@]}"
+}
+
+function menu_exit() {
+	if [[ $UNSAVED_CHANGES == "true" ]]; then
+		dialog \
+			--help-button --help-label "Back" \
+			--yes-label "Save" --no-label "Discard" \
+			--yesno "Do you want to save your configuration?\n(Press <ESC><ESC>, or choose <Back> to continue gentoo configuration)." \
+			"${CONFIRM_SIZE[@]}"
+
+		local diag_exit="$?"
+		if [[ $diag_exit == 0 ]]; then
+			# <Save>
+			save "$CONFIG_FILE"
+			clear_and_exit 0
+		elif [[ $diag_exit == 1 ]]; then
+			# <Discard>
+			clear_and_exit 0
+		else
+			# Back to menu (<ESC><ESC>, <Back>)
+			true
+		fi
+	else
+		# Nothing was changed. Exit immediately.
+		clear_and_exit 0
+	fi
+}
+
+function menu_save_as() {
+	dialog \
+		--ok-label "Save" \
+		--inputbox "Enter a filename to which this configuration should be saved.\n(Press <ESC><ESC>, or choose <Cancel> to abort)." \
+		"${INPUTBOX_SIZE[@]}" "$SAVE_AS_FILENAME"
+
+	local diag_exit="$?"
+	if [[ $diag_exit == 0 ]]; then
+		# <Save>
+		SAVE_AS_FILENAME="$dialog_out"
+		save "$SAVE_AS_FILENAME"
+		UNSAVED_CHANGES=false
+	else
+		# Back to menu (<ESC><ESC>, <Cancel>)
+		true
+	fi
+}
+
+function menu() {
+	local item
+	local item_tag
+	local tag_item_list=()
+	declare -A reverse_lookup
+
+	# Create menu list
+	for item in "${MENU_ITEMS[@]}"; do
+		# Only if item is visible
+		"${item}_show" || continue
+
+		item_tag="$("${item}_tag")"
+		tag_item_list+=("$item_tag" "$("${item}_label")")
+		reverse_lookup["$item_tag"]="$item"
+	done
+
+	dialog --colors \
+		--title "Gentoo configuration ($RELA_CONFIG_FILE)" \
+		--extra-button --extra-label "Exit" \
+		--help-button \
+		--default-item "$SELECTED_MENU_ITEM" \
+		--ok-label "Select" --cancel-label "Save" \
+		--menu "This is the gentoo configuration menu. Read and adjust all options below carefully. Save your desired configuration and run ./install afterwards. Use <Help> if you want further information on any option." \
+		"${MENU_SIZE[@]}" "${tag_item_list[@]}"
+
+	local diag_exit="$?"
+	if [[ $diag_exit == 0 ]]; then
+		# <Select>
+		SELECTED_MENU_ITEM="$dialog_out"
+		[[ -z "$SELECTED_MENU_ITEM" ]] \
+			|| "${reverse_lookup[$SELECTED_MENU_ITEM]}_menu"
+	elif [[ $diag_exit == 1 ]]; then
+		# <Save>
+		SELECTED_MENU_ITEM="$dialog_out"
+		menu_save_as
+	elif [[ $diag_exit == 2 ]]; then
+		# <Help>
+		SELECTED_MENU_ITEM="${dialog_out#HELP }"
+		msgbox_help "$("${reverse_lookup[$SELECTED_MENU_ITEM]}_help")"
+	else
+		# Exit (<ESC><ESC>, <Exit>)
+		SELECTED_MENU_ITEM="${dialog_out:-$SELECTED_MENU_ITEM}"
+		menu_exit
+		true
+	fi
+}
+
+function init_menu_size() {
+	local cols
+	local rows
+	cols=$(tput cols)  || cols=80
+	rows=$(tput lines) || rows=24
+
+	local max_h=$((rows - 3))
+	local max_w=$((cols - 6))
+
+	SELECTED_MENU_ITEM=""
+	MENU_SIZE=("$max_h" "$max_w" "$((max_h - 8))")
+	INPUTBOX_SIZE=("11" "$max_w")
+	EDITTEXT_SIZE=("$max_h" "$max_w")
+	RADIOLIST_SIZE=("$max_h" "$max_w" "$((max_h - 12))")
+	BUILDLIST_SIZE=("$max_h" "$max_w" "$((max_h - 12))")
+	HELP_POPUP_SIZE=("$((max_h - 12))" "$((max_w - 10))")
+	CONFIRM_SIZE=("8" "66")
+}
+
+#SELECTED_MENU_ITEM=""
+#MENU_SIZE=("20" "76" "12")
+#INPUTBOX_SIZE=("11" "76")
+#EDITTEXT_SIZE=("16" "76")
+#RADIOLIST_SIZE=("20" "76" "8")
+#BUILDLIST_SIZE=("20" "76" "8")
+#HELP_POPUP_SIZE=("8" "66")
+#CONFIRM_SIZE=("8" "66")
+init_menu_size
+
+
+################################################
+# Menu definition
+
+MENU_ITEMS=(
+	"PARTITIONING_SCHEME"
+	"PARTITIONING_BOOT_TYPE"
+	"PARTITIONING_BOOT_DEVICE"
+	"PARTITIONING_USE_SWAP"
+	"PARTITIONING_SWAP"
+	"PARTITIONING_SWAP_DEVICE"
+	"PARTITIONING_ROOT_FS"
+	"PARTITIONING_USE_LUKS"
+	"PARTITIONING_ZFS_POOL_TYPE"
+	"PARTITIONING_ZFS_USE_ENCRYPTION"
+	"PARTITIONING_ZFS_USE_COMPRESSION"
+	"PARTITIONING_ZFS_COMPRESSION"
+	"PARTITIONING_BTRFS_RAID_TYPE"
+	"PARTITIONING_DEVICE"
+	"PARTITIONING_DEVICES"
+	"--------"
+	"HOSTNAME"
+	"TIMEZONE"
+	"KEYMAP"
+	"KEYMAP_INITRAMFS_OTHER"
+	"KEYMAP_INITRAMFS"
+	"LOCALES"
+	"LOCALE"
+	"SYSTEMD_NETWORKD"
+	"SYSTEMD_INITRAMFS_SSHD"
+	"SYSTEMD_NETWORKD_INTERFACE_NAME"
+	"SYSTEMD_NETWORKD_DHCP"
+	"SYSTEMD_NETWORKD_ADDRESSES"
+	"SYSTEMD_NETWORKD_GATEWAY"
+	"--------"
+	"STAGE3_VARIANT"
+	"PORTAGE_SYNC_TYPE"
+	"PORTAGE_GIT_FULL_HISTORY"
+	"PORTAGE_GIT_MIRROR"
+	"GENTOO_MIRROR"
+	"GENTOO_ARCH"
+	"USE_PORTAGE_TESTING"
+	"SELECT_MIRRORS"
+	"SELECT_MIRRORS_LARGE_FILE"
+	"--------"
+	"ENABLE_SSHD"
+	"ROOT_SSH_AUTHORIZED_KEYS"
+	"ADDITIONAL_PACKAGES"
+)
+
+function --------_tag()   { echo "────────────────────────────"; }
+function --------_label() { echo "────────────────────────────"; }
+function --------_show()  { return 0; }
+function --------_help()  { echo "Congratulations, you found a separator."; }
+function --------_menu()  { true; }
+
+function PARTITIONING_SCHEME_tag()   { echo "Partitioning scheme"; }
+function PARTITIONING_SCHEME_label() { echo "($PARTITIONING_SCHEME)"; }
+function PARTITIONING_SCHEME_show()  { return 0; }
+function PARTITIONING_SCHEME_help()  { echo "Select the desired partitioning scheme."; }
+function PARTITIONING_SCHEME_menu()  {
+	if menu_radiolist_labeled \
+		"Select partitioning scheme" \
+		"Select which partitioning scheme you want to follow. Have a look at the help text for this option (available in the menu) for more details.\n\nAll options support EFI/BIOS, swap and some form of encryption (luks/zfs).\n" \
+		"$PARTITIONING_SCHEME" \
+		"${ALL_PARTITIONING_SCHEMES[@]}"
+	then
+		# Set disk scheme
+		case "$dialog_out" in
+			"classic_single_disk") create_classic_single_disk_layout swap=8GiB type="$DEFAULT_BOOT_TYPE" luks=false root_fs=ext4 /dev/sdX ;;
+			"existing_partitions") create_existing_partitions_layout boot=/dev/sdA swap=false type="$DEFAULT_BOOT_TYPE" /dev/sdX ;;
+			"zfs_centric")         create_zfs_centric_layout swap=8GiB type="$DEFAULT_BOOT_TYPE" encrypt=true compress=zstd pool_type=standard /dev/sdX ;;
+			"btrfs_centric")       create_btrfs_centric_layout swap=8GiB type="$DEFAULT_BOOT_TYPE" raid_type=raid0 luks=false /dev/sdX ;;
+			"raid0_luks")          create_raid0_luks_layout swap=8GiB type="$DEFAULT_BOOT_TYPE" root_fs=ext4 /dev/sdX /dev/sdY ;;
+			"custom")              PARTITIONING_SCHEME="$dialog_out" ;;
+		esac
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_BOOT_TYPE_tag()   { echo " ├ Boot type"; }
+function PARTITIONING_BOOT_TYPE_label() { echo " ├ ($PARTITIONING_BOOT_TYPE)$([[ $PARTITIONING_BOOT_TYPE == efi && $HAS_EFI_SUPPORT == false ]] && echo -n " \Z1$EFI_UNSUPPORTED_MESSAGE_SHORT\Zn" || echo -n "")"; }
+function PARTITIONING_BOOT_TYPE_show()  { [[ $PARTITIONING_SCHEME != "custom" ]]; }
+function PARTITIONING_BOOT_TYPE_help()  { echo "Select whether to use EFI or BIOS boot."; }
+function PARTITIONING_BOOT_TYPE_menu()  {
+	if menu_radiolist_labeled \
+		"Select boot type" \
+		"Select whether your want to use EFI or BIOS boot.$(on_off_str "$HAS_EFI_SUPPORT" "" " \Z1$EFI_UNSUPPORTED_MESSAGE\Zn")" \
+		"$PARTITIONING_BOOT_TYPE" \
+		"${PARTITIONING_BOOT_TYPES[@]}"
+	then
+		PARTITIONING_BOOT_TYPE="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_BOOT_DEVICE_tag()   { echo " ├ Boot Device"; }
+function PARTITIONING_BOOT_DEVICE_label() {
+	local devshort=$PARTITIONING_BOOT_DEVICE
+	devshort=$(shorten_device "$devshort")
+	if [[ -e "$PARTITIONING_BOOT_DEVICE" ]]; then
+		echo " ├ ($devshort)"
+	else
+		echo " ├ (\Z1$devshort\Zn)"
+	fi
+}
+function PARTITIONING_BOOT_DEVICE_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "existing_partitions"; }
+function PARTITIONING_BOOT_DEVICE_help()  { echo "The device to use for the boot partition. For EFI systems this is the efi partition. Must be formatted already."; }
+function PARTITIONING_BOOT_DEVICE_menu()  {
+	if menu_select_device \
+		"Select boot device" \
+		"Select the device containing the EFI filesystem or /boot partition respectively for systems using efi or bios boot." \
+		"$PARTITIONING_BOOT_DEVICE"
+	then
+		PARTITIONING_BOOT_DEVICE="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_USE_SWAP_tag()   { echo " ├ Use swap"; }
+function PARTITIONING_USE_SWAP_label() { on_off_label "$PARTITIONING_USE_SWAP" " ├ "; }
+function PARTITIONING_USE_SWAP_show()  { [[ $PARTITIONING_SCHEME != "custom" ]]; }
+function PARTITIONING_USE_SWAP_help()  { echo "Select whether or not to create a swap partition."; }
+function PARTITIONING_USE_SWAP_menu()  {
+	on_off_toggle "PARTITIONING_USE_SWAP"
+	UNSAVED_CHANGES=true
+}
+
+function PARTITIONING_SWAP_tag()   { echo " │  └ Swap amount"; }
+function PARTITIONING_SWAP_label() { echo " │  └ ($PARTITIONING_SWAP)"; }
+function PARTITIONING_SWAP_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && is_on "$PARTITIONING_USE_SWAP" && ! one_of "$PARTITIONING_SCHEME" "existing_partitions"; }
+function PARTITIONING_SWAP_help()  { echo "Select the amount of swap to use."; }
+function PARTITIONING_SWAP_menu()  {
+	dialog \
+		--title "Select swap amount" \
+		--inputbox "Enter the amount of swap for the new system. Use the correct suffix (e.g. 16GiB, 1000MB)." \
+		"${INPUTBOX_SIZE[@]}" "$PARTITIONING_SWAP" \
+		|| return 0
+	PARTITIONING_SWAP="$dialog_out"
+	UNSAVED_CHANGES=true
+}
+
+
+function PARTITIONING_SWAP_DEVICE_tag()   { echo " │  └ Swap Device"; }
+function PARTITIONING_SWAP_DEVICE_label() {
+	local dev=${PARTITIONING_SWAP_DEVICE:-/dev/sdB}
+	local devshort
+	devshort=$(shorten_device "$dev")
+	if [[ -e "$dev" ]]; then
+		echo " │  └ ($devshort)"
+	else
+		echo " │  └ (\Z1$devshort\Zn)"
+	fi
+}
+function PARTITIONING_SWAP_DEVICE_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && is_on "$PARTITIONING_USE_SWAP" && one_of "$PARTITIONING_SCHEME" "existing_partitions"; }
+function PARTITIONING_SWAP_DEVICE_help()  { echo "The device to use as swap."; }
+function PARTITIONING_SWAP_DEVICE_menu()  {
+	if menu_select_device \
+		"Select swap device" \
+		"Select the device to use as swap." \
+		"$PARTITIONING_SWAP_DEVICE"
+	then
+		PARTITIONING_SWAP_DEVICE="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_ROOT_FS_tag()   { echo " ├ Root filesystem"; }
+function PARTITIONING_ROOT_FS_label() { echo " ├ ($PARTITIONING_ROOT_FS)"; }
+function PARTITIONING_ROOT_FS_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "classic_single_disk" "raid0_luks"; }
+function PARTITIONING_ROOT_FS_help()  { echo "Select the amount of swap to use."; }
+function PARTITIONING_ROOT_FS_menu()  {
+	if menu_radiolist \
+		"Select root fstype" \
+		"Select which filesystem to use on the root partition." \
+		"$PARTITIONING_ROOT_FS" \
+		"${PARTITIONING_ROOT_FS_TYPES[@]}"
+	then
+		PARTITIONING_ROOT_FS="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_USE_LUKS_tag()   { echo " ├ LUKS Encryption"; }
+function PARTITIONING_USE_LUKS_label() { on_off_label "$PARTITIONING_USE_LUKS" " ├ "; }
+function PARTITIONING_USE_LUKS_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "classic_single_disk" "btrfs_centric"; }
+function PARTITIONING_USE_LUKS_help()  { echo "Determines if LUKS will be used to encrypt your root partition. You can export the desired encryption key via export GENTOO_INSTALL_ENCRYPTION_KEY='...' before installing if you don't want to be asked."; }
+function PARTITIONING_USE_LUKS_menu()  {
+	on_off_toggle "PARTITIONING_USE_LUKS"
+	UNSAVED_CHANGES=true
+}
+
+function PARTITIONING_ZFS_USE_ENCRYPTION_tag()   { echo " ├ ZFS Encryption"; }
+function PARTITIONING_ZFS_USE_ENCRYPTION_label() { on_off_label "$PARTITIONING_ZFS_USE_ENCRYPTION" " ├ "; }
+function PARTITIONING_ZFS_USE_ENCRYPTION_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "zfs_centric" && one_of "$PARTITIONING_ZFS_POOL_TYPE" "standard"; }
+function PARTITIONING_ZFS_USE_ENCRYPTION_help()  { echo "Determines if ZFS encryption will be used to encrypt your root partition. You can export the desired encryption key via export GENTOO_INSTALL_ENCRYPTION_KEY='...' before installing if you don't want to be asked."; }
+function PARTITIONING_ZFS_USE_ENCRYPTION_menu()  {
+	on_off_toggle "PARTITIONING_ZFS_USE_ENCRYPTION"
+	UNSAVED_CHANGES=true
+}
+
+# TODO keylocation prompt | file
+# TODO if loc is file, another checkbox to "autogenerate and save new key" openssl rand -hex 32 > file
+
+function PARTITIONING_ZFS_USE_COMPRESSION_tag()   { echo " ├ Use ZFS Compression"; }
+function PARTITIONING_ZFS_USE_COMPRESSION_label() { on_off_label "$PARTITIONING_ZFS_USE_COMPRESSION" " ├ "; }
+function PARTITIONING_ZFS_USE_COMPRESSION_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "zfs_centric" && one_of "$PARTITIONING_ZFS_POOL_TYPE" "standard"; }
+function PARTITIONING_ZFS_USE_COMPRESSION_help()  { echo "Determines if compression should be enabled on the ZFS datasets."; }
+function PARTITIONING_ZFS_USE_COMPRESSION_menu()  {
+	on_off_toggle "PARTITIONING_ZFS_USE_COMPRESSION"
+	UNSAVED_CHANGES=true
+}
+
+function PARTITIONING_ZFS_COMPRESSION_tag()   { echo " │  └ Compression algorithm"; }
+function PARTITIONING_ZFS_COMPRESSION_label() { echo " │  └ ($PARTITIONING_ZFS_COMPRESSION)"; }
+function PARTITIONING_ZFS_COMPRESSION_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "zfs_centric" && one_of "$PARTITIONING_ZFS_POOL_TYPE" "standard" && is_on "$PARTITIONING_ZFS_USE_COMPRESSION"; }
+function PARTITIONING_ZFS_COMPRESSION_help()  { echo "Determines the compression algorithm used on the ZFS datasets. 'on' means to use the default compression algorithm determined by ZFS. If you need more granular control over the specific levels such as gzip-N or zstd-N, please use a custom pool."; }
+function PARTITIONING_ZFS_COMPRESSION_menu()  {
+	if menu_radiolist \
+		"Select ZFS compression algorithm" \
+		"Determines the compression algorithm used on the ZFS datasets. The special value 'on' means to use the default compression algorithm as determined by ZFS." \
+		"$PARTITIONING_ZFS_COMPRESSION" \
+		"${PARTITIONING_ZFS_COMPRESSIONS[@]}"
+	then
+		PARTITIONING_ZFS_COMPRESSION="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_ZFS_POOL_TYPE_tag()   { echo " ├ Pool type"; }
+function PARTITIONING_ZFS_POOL_TYPE_label() { echo " ├ ($PARTITIONING_ZFS_POOL_TYPE)"; }
+function PARTITIONING_ZFS_POOL_TYPE_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "zfs_centric"; }
+function PARTITIONING_ZFS_POOL_TYPE_help()  { echo "Determines how the zfs pool will be initialized. Select 'standard' for a default pool setup that puts all given devices in one pool with ZSTD compression. Selecting 'custom' will require you to write your own pool creation function in the output config."; }
+function PARTITIONING_ZFS_POOL_TYPE_menu()  {
+	if menu_radiolist \
+		"Select ZFS pool type" \
+		"Select 'standard' for a default pool setup that puts all given devices in one pool with ZSTD compression. Selecting 'custom' will require you to write your own pool creation function in the output config." \
+		"$PARTITIONING_ZFS_POOL_TYPE" \
+		"${PARTITIONING_ZFS_POOL_TYPES[@]}"
+	then
+		PARTITIONING_ZFS_POOL_TYPE="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_BTRFS_RAID_TYPE_tag()   { echo " ├ Btrfs raid type"; }
+function PARTITIONING_BTRFS_RAID_TYPE_label() { echo " ├ ($PARTITIONING_BTRFS_RAID_TYPE)"; }
+function PARTITIONING_BTRFS_RAID_TYPE_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "btrfs_centric"; }
+function PARTITIONING_BTRFS_RAID_TYPE_help()  { echo "Determines the type of the btrfs pool."; }
+function PARTITIONING_BTRFS_RAID_TYPE_menu()  {
+	if menu_radiolist \
+		"Select raid type" \
+		"Select which raid type to use for the btrfs pool." \
+		"$PARTITIONING_BTRFS_RAID_TYPE" \
+		"${PARTITIONING_BTRFS_RAID_TYPES[@]}"
+	then
+		PARTITIONING_BTRFS_RAID_TYPE="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_DEVICE_tag()   { echo " └ Device"; }
+function PARTITIONING_DEVICE_label() {
+	local devshort=$PARTITIONING_DEVICE
+	devshort=$(shorten_device "$devshort")
+	if [[ -e "$PARTITIONING_DEVICE" ]]; then
+		echo " └ ($devshort)"
+	else
+		echo " └ (\Z1$devshort\Zn)"
+	fi
+}
+function PARTITIONING_DEVICE_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "classic_single_disk" "existing_partitions"; }
+function PARTITIONING_DEVICE_help()  { echo "The block device to which the layout will be applied."; }
+function PARTITIONING_DEVICE_menu()  {
+	if menu_select_device \
+		"Select root device" \
+		"Select the device to use as the root device." \
+		"$PARTITIONING_DEVICE"
+	then
+		PARTITIONING_DEVICE="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_DEVICES_tag()   { echo " └ Devices"; }
+function PARTITIONING_DEVICES_label() {
+	local invalid=0
+	for dev in "${PARTITIONING_DEVICES[@]}"; do
+		[[ -e "$dev" ]] \
+			|| ((++invalid))
+	done
+
+	if [[ "$invalid" -gt 0 ]]; then
+		echo " └ (${#PARTITIONING_DEVICES[@]} devices, \Z1$invalid invalid\Zn)"
+	elif [[ "${#PARTITIONING_DEVICES[@]}" -eq 1 && "$PARTITIONING_SCHEME" == "raid0_luks" ]]; then
+		echo " └ (${#PARTITIONING_DEVICES[@]} devices, \Z1need at least 2\Zn)"
+	elif [[ "${#PARTITIONING_DEVICES[@]}" -eq 0 ]]; then
+		echo " └ (${#PARTITIONING_DEVICES[@]} devices, \Z1need at least 1\Zn)"
+	else
+		echo " └ (${#PARTITIONING_DEVICES[@]} devices)"
+	fi
+}
+function PARTITIONING_DEVICES_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "raid0_luks" "zfs_centric" "btrfs_centric"; }
+function PARTITIONING_DEVICES_help()  { echo "The block devices to which the layout will be applied."; }
+function PARTITIONING_DEVICES_menu()  {
+	local invalid=()
+	for dev in "${PARTITIONING_DEVICES[@]}"; do
+		[[ -e "$dev" ]] \
+			|| invalid+=("$dev")
+	done
+
+	local invalid_line=""
+	if [[ "${#invalid[@]}" -gt 0 ]]; then
+		invalid_line="\n\nInvalid devices: \Z1${invalid[*]}\Zn"
+	fi
+
+	dialog \
+		--title "Select devices" \
+		--inputbox "Enter the path of all devices which you want to partition, separated by space. (e.g. /dev/sda /dev/sdb).$invalid_line" \
+		"${INPUTBOX_SIZE[@]}" "${PARTITIONING_DEVICES[*]}" \
+		|| return 0
+	read -ra PARTITIONING_DEVICES <<< "$dialog_out"
+	UNSAVED_CHANGES=true
+}
+
+function HOSTNAME_tag()   { echo "Hostname"; }
+function HOSTNAME_label() { echo "($HOSTNAME)"; }
+function HOSTNAME_show()  { return 0; }
+function HOSTNAME_help()  { echo "Enter the desired system hostname here. Be aware that when creating mdadm raid arrays, this value will be recorded in metadata block. If you change it later, you should also update the metadata."; }
+function HOSTNAME_menu()  {
+	dialog \
+		--title "Select hostname" \
+		--inputbox "Enter the hostname for your new system." \
+		"${INPUTBOX_SIZE[@]}" "$HOSTNAME" \
+		|| return 0
+	HOSTNAME="$dialog_out"
+	UNSAVED_CHANGES=true
+}
+
+function TIMEZONE_tag()   { echo "Timezone"; }
+function TIMEZONE_label() { echo "($TIMEZONE)"; }
+function TIMEZONE_show()  { return 0; }
+function TIMEZONE_help()  { echo "The timezone for the new system."; }
+function TIMEZONE_menu()  {
+	if menu_radiolist \
+		"Select timezone" \
+		"Select which timezone to use." \
+		"$TIMEZONE" \
+		"${ALL_TIMEZONES[@]}"
+	then
+		TIMEZONE="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function KEYMAP_tag()   { echo "Keymap"; }
+function KEYMAP_label() { echo "($KEYMAP)"; }
+function KEYMAP_show()  { return 0; }
+function KEYMAP_help()  { echo "The default vconsole keymap for the system."; }
+function KEYMAP_menu()  {
+	if menu_radiolist \
+		"Select initramfs keymap" \
+		"Select which keymap to use in the vconsole." \
+		"$KEYMAP" \
+		"${ALL_KEYMAPS[@]}"
+	then
+		KEYMAP="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function KEYMAP_INITRAMFS_OTHER_tag()   { echo "Different initramfs keymap"; }
+function KEYMAP_INITRAMFS_OTHER_label() { on_off_label "$KEYMAP_INITRAMFS_OTHER"; }
+function KEYMAP_INITRAMFS_OTHER_show()  { return 0; }
+function KEYMAP_INITRAMFS_OTHER_help()  { echo "Whether another keymap should be used for the initramfs. If enabled, you will be able to choose a separate keymap below."; }
+function KEYMAP_INITRAMFS_OTHER_menu()  {
+	on_off_toggle "KEYMAP_INITRAMFS_OTHER"
+	UNSAVED_CHANGES=true
+	[[ -z $KEYMAP_INITRAMFS ]] \
+		&& KEYMAP_INITRAMFS="$KEYMAP"
+}
+
+function KEYMAP_INITRAMFS_tag()   { echo " └ Keymap (initramfs)"; }
+function KEYMAP_INITRAMFS_label() { echo " └ ($KEYMAP_INITRAMFS)"; }
+function KEYMAP_INITRAMFS_show()  { is_on "$KEYMAP_INITRAMFS_OTHER"; }
+function KEYMAP_INITRAMFS_help()  { echo "The default vconsole keymap for the initrams. This is important if need to unlock an encrypted partition when booting."; }
+function KEYMAP_INITRAMFS_menu()  {
+	if menu_radiolist \
+		"Select initramfs keymap" \
+		"Select which keymap to use in the initramfs vconsole." \
+		"$KEYMAP_INITRAMFS" \
+		"${ALL_KEYMAPS[@]}"
+	then
+		KEYMAP_INITRAMFS="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function LOCALES_tag()   { echo "Locales"; }
+function LOCALES_label() { echo "$N_LOCALES selected"; }
+function LOCALES_show()  { return 0; }
+function LOCALES_help()  { echo "The locales to generate for the new system. Be careful that the syntax for locales is a different from the resulting name of the genereated locales of locale-gen. For example the locale 'en_US.utf8' is enabled via 'en_US.UTF-8 UTF-8')."; }
+function LOCALES_menu()  {
+	if menu_splitlist "Select locales" "Select which locales to generate." "$SELECTED_LOCALES" "${SUPPORTED_LOCALES[@]}"; then
+		SELECTED_LOCALES="$dialog_out"
+		recalculate_locales
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function LOCALE_tag()   { echo "Default locale"; }
+function LOCALE_label() { echo "($LOCALE)"; }
+function LOCALE_show()  { return 0; }
+function LOCALE_help()  { echo "The locale to use for the new system. See \`locale -a\` for available options, and be sure to generate the locale by adding it to the list of locales above."; }
+function LOCALE_menu()  {
+	if menu_radiolist \
+		"Select default locale" \
+		"Select which locale to use as the default. Remember to also add the desired locale to the list of locales above." \
+		"$LOCALE" \
+		"${LOCALE_A[@]}"
+	then
+		LOCALE="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function SYSTEMD_NETWORKD_tag()   { echo "Configure network"; }
+function SYSTEMD_NETWORKD_label() { on_off_label "$SYSTEMD_NETWORKD"; }
+function SYSTEMD_NETWORKD_show()  { [[ $STAGE3_VARIANT == *systemd* ]]; }
+function SYSTEMD_NETWORKD_help()  { echo "Enable systemd-network to configure networking on the new system."; }
+function SYSTEMD_NETWORKD_menu()  {
+	on_off_toggle "SYSTEMD_NETWORKD"
+	UNSAVED_CHANGES=true
+}
+
+function SYSTEMD_INITRAMFS_SSHD_tag()   { echo " ├ Enable sshd in initramfs"; }
+function SYSTEMD_INITRAMFS_SSHD_label() { on_off_label "$SYSTEMD_INITRAMFS_SSHD" " ├ "; }
+function SYSTEMD_INITRAMFS_SSHD_show()  { [[ $STAGE3_VARIANT == *systemd* ]] && is_on "$SYSTEMD_NETWORKD"; }
+function SYSTEMD_INITRAMFS_SSHD_help()  { echo "Install and enable sshd in the initramfs. This can be used to unlock encrypted partitions / ZFS via ssh, or to get an emergency shell. Visit https://github.com/gsauthof/dracut-sshd for more information."; }
+function SYSTEMD_INITRAMFS_SSHD_menu()  {
+	on_off_toggle "SYSTEMD_INITRAMFS_SSHD"
+	UNSAVED_CHANGES=true
+}
+
+function SYSTEMD_NETWORKD_INTERFACE_NAME_tag()   { echo " ├ Interface Name"; }
+function SYSTEMD_NETWORKD_INTERFACE_NAME_label() { echo " ├ ($(ellipsis 20 "$SYSTEMD_NETWORKD_INTERFACE_NAME"))"; }
+function SYSTEMD_NETWORKD_INTERFACE_NAME_show()  { [[ $STAGE3_VARIANT == *systemd* ]] && is_on "$SYSTEMD_NETWORKD"; }
+function SYSTEMD_NETWORKD_INTERFACE_NAME_help()  { echo "The network interface(s) to configure. Defaults to all interfaces matching en*."; }
+function SYSTEMD_NETWORKD_INTERFACE_NAME_menu()  {
+	dialog \
+		--title "Network Interface Name" \
+		--inputbox "Enter the network interface name which should be configured. Can include wildcards." \
+		"${INPUTBOX_SIZE[@]}" "$SYSTEMD_NETWORKD_INTERFACE_NAME" \
+		|| return 0
+	SYSTEMD_NETWORKD_INTERFACE_NAME="$dialog_out"
+	UNSAVED_CHANGES=true
+}
+
+function SYSTEMD_NETWORKD_DHCP_tag()   { echo " └ Static IP"; }
+function SYSTEMD_NETWORKD_DHCP_label() { on_off_label_inverted "$SYSTEMD_NETWORKD_DHCP" " └ "; }
+function SYSTEMD_NETWORKD_DHCP_show()  { [[ $STAGE3_VARIANT == *systemd* ]] && is_on "$SYSTEMD_NETWORKD"; }
+function SYSTEMD_NETWORKD_DHCP_help()  { echo "Use DHCP to obtain network configuration."; }
+function SYSTEMD_NETWORKD_DHCP_menu()  {
+	on_off_toggle "SYSTEMD_NETWORKD_DHCP"
+	UNSAVED_CHANGES=true
+}
+
+function SYSTEMD_NETWORKD_ADDRESSES_tag()   { echo "   ├ Addresses"; }
+function SYSTEMD_NETWORKD_ADDRESSES_label() { echo "   ├ ($(ellipsis 20 "${SYSTEMD_NETWORKD_ADDRESSES[*]}"))"; }
+function SYSTEMD_NETWORKD_ADDRESSES_show()  { [[ $STAGE3_VARIANT == *systemd* ]] && is_on "$SYSTEMD_NETWORKD" && is_off "$SYSTEMD_NETWORKD_DHCP"; }
+function SYSTEMD_NETWORKD_ADDRESSES_help()  { echo "A space-separated list of addresses with CIDR mask to assign to the network interface."; }
+function SYSTEMD_NETWORKD_ADDRESSES_menu()  {
+	dialog \
+		--title "Network Addresses" \
+		--inputbox "A space-separated list of addresses with CIDR mask to assign to the network interface." \
+		"${INPUTBOX_SIZE[@]}" "${SYSTEMD_NETWORKD_ADDRESSES[*]}" \
+		|| return 0
+	# shellcheck disable=SC2206
+	SYSTEMD_NETWORKD_ADDRESSES=($dialog_out)
+	UNSAVED_CHANGES=true
+}
+
+function SYSTEMD_NETWORKD_GATEWAY_tag()   { echo "   └ Gateway"; }
+function SYSTEMD_NETWORKD_GATEWAY_label() { echo "   └ ($(ellipsis 20 "$SYSTEMD_NETWORKD_GATEWAY"))"; }
+function SYSTEMD_NETWORKD_GATEWAY_show()  { [[ $STAGE3_VARIANT == *systemd* ]] && is_on "$SYSTEMD_NETWORKD" && is_off "$SYSTEMD_NETWORKD_DHCP"; }
+function SYSTEMD_NETWORKD_GATEWAY_help()  { echo "The gateway address for the network."; }
+function SYSTEMD_NETWORKD_GATEWAY_menu()  {
+	dialog \
+		--title "Network Gateway" \
+		--inputbox "The gateway address for the network." \
+		"${INPUTBOX_SIZE[@]}" "$SYSTEMD_NETWORKD_GATEWAY" \
+		|| return 0
+	SYSTEMD_NETWORKD_GATEWAY="$dialog_out"
+	UNSAVED_CHANGES=true
+}
+
+function STAGE3_VARIANT_tag()   { echo "Stage3 variant & Init system"; }
+function STAGE3_VARIANT_label() { echo "($STAGE3_VARIANT)"; }
+function STAGE3_VARIANT_show()  { return 0; }
+function STAGE3_VARIANT_help()  { echo "Select which stage3 tarball to use. Implicitly determines whether systemd or OpenRC is used. Not all stage3 variants have been tested with this installer. The basic installation process is always the same, but due to complex profiles, unexpected blockers may arise when emerge is called. Stick to the basic choices and change after bootstraping, unless you know how to invervene while installing."; }
+function STAGE3_VARIANT_menu()  {
+	if menu_radiolist_labeled \
+		"Select stage3 variant" \
+		"Select the base stage3 tarball variant to use for bootstrapping the system. Implicitly determines whether systemd or OpenRC is used. Not all stage3 variants have been tested with this installer. The basic installation process is always the same, but due to complex profiles, unexpected blockers may arise when emerge is called. Stick to the basic choices and change after bootstraping, unless you know how to invervene while installing." \
+		"$STAGE3_VARIANT" \
+		"${ALL_STAGE3_VARIANTS[@]}"
+	then
+		STAGE3_VARIANT="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PORTAGE_SYNC_TYPE_tag()   { echo "Portage tree sync-type"; }
+function PORTAGE_SYNC_TYPE_label() { echo "($PORTAGE_SYNC_TYPE)"; }
+function PORTAGE_SYNC_TYPE_show()  { return 0; }
+function PORTAGE_SYNC_TYPE_help()  { echo "The portage tree sync-type."; }
+function PORTAGE_SYNC_TYPE_menu()  {
+	if menu_radiolist \
+		"Select sync-type" \
+		"Select the portage tree sync-type. Git is generally preferred for modern system installations." \
+		"$PORTAGE_SYNC_TYPE" \
+		"${PORTAGE_SYNC_TYPES[@]}"
+	then
+		PORTAGE_SYNC_TYPE="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PORTAGE_GIT_FULL_HISTORY_tag()   { echo " ├ Download full history"; }
+function PORTAGE_GIT_FULL_HISTORY_label() { on_off_label "$PORTAGE_GIT_FULL_HISTORY" " ├ "; }
+function PORTAGE_GIT_FULL_HISTORY_show()  { one_of "$PORTAGE_SYNC_TYPE" "git"; }
+function PORTAGE_GIT_FULL_HISTORY_help()  { echo "Determines if the full git history of the portage tree will be downloaded. This can easily take up 1-2GB of disk space."; }
+function PORTAGE_GIT_FULL_HISTORY_menu()  {
+	on_off_toggle "PORTAGE_GIT_FULL_HISTORY"
+	UNSAVED_CHANGES=true
+}
+
+function PORTAGE_GIT_MIRROR_tag()   { echo " └ Git mirror"; }
+function PORTAGE_GIT_MIRROR_label() { echo " └ ($(ellipsis 20 "$PORTAGE_GIT_MIRROR"))"; }
+function PORTAGE_GIT_MIRROR_show()  { one_of "$PORTAGE_SYNC_TYPE" "git"; }
+function PORTAGE_GIT_MIRROR_help()  { echo "The portage git mirror is the git endpoint that is used to sync the portage tree. You usually should not need to change this!"; }
+function PORTAGE_GIT_MIRROR_menu()  {
+	dialog \
+		--title "Select portage git mirror" \
+		--inputbox "Enter the portage git mirror that should be used to sync the portage tree." \
+		"${INPUTBOX_SIZE[@]}" "$PORTAGE_GIT_MIRROR" \
+		|| return 0
+	PORTAGE_GIT_MIRROR="$dialog_out"
+	UNSAVED_CHANGES=true
+}
+
+function GENTOO_MIRROR_tag()   { echo "Gentoo mirror"; }
+function GENTOO_MIRROR_label() { echo "($(ellipsis 20 "$GENTOO_MIRROR"))"; }
+function GENTOO_MIRROR_show()  { return 0; }
+function GENTOO_MIRROR_help()  { echo "Enter the initial gentoo mirror that should be used for the installation process (until mirrorselect is run)."; }
+function GENTOO_MIRROR_menu()  {
+	dialog \
+		--title "Select gentoo mirror" \
+		--inputbox "Enter the initial gentoo mirror that should be used for the system (or until mirrorselect is run). You need to enter the FULL PATH to the tree including relevant subdirectories. Leave this as it is if in doubt!" \
+		"${INPUTBOX_SIZE[@]}" "$GENTOO_MIRROR" \
+		|| return 0
+	GENTOO_MIRROR="$dialog_out"
+	UNSAVED_CHANGES=true
+}
+
+function GENTOO_ARCH_tag()   { echo "Gentoo arch"; }
+function GENTOO_ARCH_label() { echo "($GENTOO_ARCH)"; }
+function GENTOO_ARCH_show()  { return 0; }
+function GENTOO_ARCH_help()  { echo "Select gentoo's architecture tag for the new system."; }
+function GENTOO_ARCH_menu()  {
+	if menu_radiolist \
+		"Select architecture" \
+		"Select the architecture for the new system." \
+		"$GENTOO_ARCH" \
+		"${ALL_GENTOO_ARCHS[@]}"
+	then
+		GENTOO_ARCH="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function USE_PORTAGE_TESTING_tag()   { echo "Enable bleeding edge (~$GENTOO_ARCH)"; }
+function USE_PORTAGE_TESTING_label() { on_off_label "$USE_PORTAGE_TESTING"; }
+function USE_PORTAGE_TESTING_show()  { return 0; }
+function USE_PORTAGE_TESTING_help()  { echo "Determines if the system should use bleeding edge software from the respective architecture's testing branch. This will add ACCEPT_KEYWORDS=\"~\$GENTOO_ARCH\" to /etc/portage/make.conf"; }
+function USE_PORTAGE_TESTING_menu()  {
+	on_off_toggle "USE_PORTAGE_TESTING"
+	UNSAVED_CHANGES=true
+}
+
+function SELECT_MIRRORS_tag()   { echo "Run mirrorselect"; }
+function SELECT_MIRRORS_label() { on_off_label "$SELECT_MIRRORS"; }
+function SELECT_MIRRORS_show()  { return 0; }
+function SELECT_MIRRORS_help()  { echo "Determines if mirrorselect will be used to determine the best gentoo mirror for the new system."; }
+function SELECT_MIRRORS_menu()  {
+	on_off_toggle "SELECT_MIRRORS"
+	UNSAVED_CHANGES=true
+}
+
+function SELECT_MIRRORS_LARGE_FILE_tag()   { echo " └ Use large files"; }
+function SELECT_MIRRORS_LARGE_FILE_label() { on_off_label "$SELECT_MIRRORS_LARGE_FILE" " └ "; }
+function SELECT_MIRRORS_LARGE_FILE_show()  { is_on "$SELECT_MIRRORS"; }
+function SELECT_MIRRORS_LARGE_FILE_help()  { echo "Determines if mirrorselect uses large files (~10MB) to test mirrors."; }
+function SELECT_MIRRORS_LARGE_FILE_menu()  {
+	on_off_toggle "SELECT_MIRRORS_LARGE_FILE"
+	UNSAVED_CHANGES=true
+}
+
+function ENABLE_SSHD_tag()   { echo "Enable sshd"; }
+function ENABLE_SSHD_label() { on_off_label "$ENABLE_SSHD"; }
+function ENABLE_SSHD_show()  { return 0; }
+function ENABLE_SSHD_help()  { echo "Install and enable sshd on the new system. A reasonably secure sshd configuration will be provided. It will by default only allow ed25519 keys, restrict key exchange algorithms to a reasonable subset, disable any password based authentication, and only allow root to login."; }
+function ENABLE_SSHD_menu()  {
+	on_off_toggle "ENABLE_SSHD"
+	UNSAVED_CHANGES=true
+}
+
+function ROOT_SSH_AUTHORIZED_KEYS_tag()   { echo "Authorized keys (root)"; }
+function ROOT_SSH_AUTHORIZED_KEYS_label() { echo "$(sed '/^\s*#/d;/^\s*$/d' <<< "$ROOT_SSH_AUTHORIZED_KEYS" | wc -l) keys"; }
+function ROOT_SSH_AUTHORIZED_KEYS_show()  { return 0; }
+function ROOT_SSH_AUTHORIZED_KEYS_help()  { echo "The authorized keys for ssh root login, one per line."; }
+function ROOT_SSH_AUTHORIZED_KEYS_menu()  {
+	# Prepare file to edit in dialog,
+	# unfortunately <() won't work (probably EOF is encountered before content is available).
+	local tmpfile
+	tmpfile="$(mktemp)" || die "Could not create temporary file."
+	cat > "$tmpfile" <<EOF
+# Enter all authorized keys for ssh root login.
+# Use <Tab> to navigate between the inputbox, <OK> and <Cancel>.
+#
+# All comments will be removed from the final file.
+# If you are on a vconsole and have no means of entering this now,
+# simply edit the final configuration later with a text editor.
+
+#ssh-ed25519 ......
+$ROOT_SSH_AUTHORIZED_KEYS
+EOF
+
+	dialog \
+		--title "Enter authorized keys" \
+		--editbox "$tmpfile" "${EDITTEXT_SIZE[@]}"
+	ROOT_SSH_AUTHORIZED_KEYS="$(sed '/^\s*#/d;/^\s*$/d' <<< "$dialog_out")"
+	UNSAVED_CHANGES=true
+}
+
+function ADDITIONAL_PACKAGES_tag()   { echo "Additional packages"; }
+function ADDITIONAL_PACKAGES_label() { echo "${#ADDITIONAL_PACKAGES[@]} packages"; }
+function ADDITIONAL_PACKAGES_show()  { return 0; }
+function ADDITIONAL_PACKAGES_help()  { echo "Enter additional packages that should be installed. It is recommended to keep this to a minimum, because of the quite \"interactive\" nature of gentoo package management ;)"; }
+function ADDITIONAL_PACKAGES_menu()  {
+	dialog \
+		--title "Additional packages" \
+		--inputbox "Enter additional packages (portage package ATOMs) to install. Delimited by space." \
+		"${INPUTBOX_SIZE[@]}" "${ADDITIONAL_PACKAGES[*]}"
+	# shellcheck disable=SC2206
+	ADDITIONAL_PACKAGES=($dialog_out)
+	UNSAVED_CHANGES=true
+}
+
+
+################################################
+# Menu functions
+
+# $1: filename
+function save() {
+	if [[ "$KEYMAP_INITRAMFS_OTHER" == "false" ]]; then
+		KEYMAP_INITRAMFS="$KEYMAP"
+	fi
+
+	cat > "$1" <<EOF
+# vim: set ft=sh ts=4 sw=4 sts=-1 noet:
+# This file will be interpreted by /bin/bash.
+
+
+################################################
+# Disk configuration
+
+$(define_disk_layout)
+
+
+################################################
+# System configuration
+
+HOSTNAME=${HOSTNAME@Q}
+TIMEZONE=${TIMEZONE@Q}
+KEYMAP=${KEYMAP@Q}
+KEYMAP_INITRAMFS=${KEYMAP_INITRAMFS@Q}
+
+LOCALES=${LOCALES@Q}
+LOCALE=${LOCALE@Q}
+
+SYSTEMD_NETWORKD=${SYSTEMD_NETWORKD@Q}
+SYSTEMD_NETWORKD_INTERFACE_NAME=${SYSTEMD_NETWORKD_INTERFACE_NAME@Q}
+SYSTEMD_NETWORKD_DHCP=${SYSTEMD_NETWORKD_DHCP@Q}
+SYSTEMD_NETWORKD_ADDRESSES=${SYSTEMD_NETWORKD_ADDRESSES@Q}
+SYSTEMD_NETWORKD_GATEWAY=${SYSTEMD_NETWORKD_GATEWAY@Q}
+SYSTEMD_INITRAMFS_SSHD=${SYSTEMD_INITRAMFS_SSHD@Q}
+
+
+################################################
+# Gentoo configuration
+
+PORTAGE_SYNC_TYPE=${PORTAGE_SYNC_TYPE@Q}
+PORTAGE_GIT_FULL_HISTORY=${PORTAGE_GIT_FULL_HISTORY@Q}
+PORTAGE_GIT_MIRROR=${PORTAGE_GIT_MIRROR@Q}
+GENTOO_MIRROR=${GENTOO_MIRROR@Q}
+GENTOO_ARCH=${GENTOO_ARCH@Q}
+STAGE3_VARIANT=${STAGE3_VARIANT@Q}
+STAGE3_BASENAME="stage3-\$GENTOO_ARCH-\$STAGE3_VARIANT"
+USE_PORTAGE_TESTING=${USE_PORTAGE_TESTING@Q}
+SELECT_MIRRORS=${SELECT_MIRRORS@Q}
+SELECT_MIRRORS_LARGE_FILE=${SELECT_MIRRORS_LARGE_FILE@Q}
+SYSTEMD=\$([[ \$STAGE3_VARIANT == *systemd* ]] && echo "true" || echo "false")
+
+
+################################################
+# Additional (optional) configuration
+
+ADDITIONAL_PACKAGES=(${ADDITIONAL_PACKAGES[@]@Q})
+ENABLE_SSHD=${ENABLE_SSHD@Q}
+ROOT_SSH_AUTHORIZED_KEYS=${ROOT_SSH_AUTHORIZED_KEYS@Q}
+
+
+################################################
+# Prove that you have read the config
+
+I_HAVE_READ_AND_EDITED_THE_CONFIG_PROPERLY=true
+EOF
+}
+
+trap 'clear_and_exit 130' SIGINT
+
+# Begin menu loop. Exit will be called to end this loop where it is appropriate.
+while true; do
+	menu
+done
