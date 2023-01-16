@@ -1,0 +1,12 @@
+# /dev/nvme0n1p5 LABEL=Linux\134x20Main
+UUID=2fb2717b-7173-40ed-9b51-bae750fa13c3	/         	ext4      	rw,relatime	0 1
+
+# /dev/nvme0n1p1
+UUID=BA03-0227      	/boot     	vfat      	rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=ascii,shortname=mixed,utf8,errors=remount-ro	0 2
+
+# /dev/sda1 LABEL=Linux\134x20Space
+UUID=3a3a4d73-9049-49d7-bba1-272d7ba1a9e2	/home     	ext4      	rw,relatime	0 2
+
+# /dev/sda3 LABEL=Linux\134x20Swap
+UUID=8b040cc8-2d6a-4e72-a750-5d1c4bea5da5	none      	swap      	defaults  	0 0
+

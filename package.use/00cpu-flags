@@ -1,0 +1,10 @@
+*/* CPU_FLAGS_X86: aes avx avx2 f16c fma3 mmx mmxext pclmul popcnt rdrand sha sse sse2 sse3 sse4_1 sse4_2 sse4a ssse3
+# required by kde-apps/kdenlive-22.08.3::gentoo
+# required by kde-apps/kdemultimedia-meta-22.08.3::gentoo
+# required by kdemultimedia-meta (argument)
+>=media-video/ffmpeg-4.4.3 libass
+# required by media-sound/pulseaudio-daemon-16.1-r3::gentoo[alsa,alsa-plugin]
+# required by media-libs/libpulse-16.1-r1::gentoo
+# required by www-client/firefox-bin-108.0.2::gentoo[pulseaudio]
+# required by firefox-bin (argument)
+>=media-plugins/alsa-plugins-1.2.7.1 pulseaudio
