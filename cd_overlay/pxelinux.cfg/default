@@ -1,0 +1,55 @@
+
+default isolinux/menu.c32
+prompt 0
+timeout 30
+
+MENU TITLE peter's livecd
+MENU ROWS 12
+MENU TIMEOUTROW 22
+MENU TABMSGROW 24
+MENU CMDLINEROW 24
+MENU HELPMSGROW 26
+MENU WIDTH 70
+MENU MARGIN 6
+
+label peter's livecd 64bit via http  (needs 500Mb ram)
+label tinycd 64bit
+  kernel /isolinux/bzImage
+  append initrd=/isolinux/initramfs.igz root=/dev/ram0 init=/linuxrc looptype=squashfs cdroot net.ifnames=0 netboot=http://10.212.0.3/tinycd/image.squashfs
+
+label memtest86+
+  kernel /isolinux/memtest86
+  append -
+
+label hardware diagnostic tool (hdt)
+  kernel /isolinux/memdisk
+  append initrd=/bootdisk/hdt.img floppy
+
+label low-level hdd diagnostic tool (mhdd)
+  kernel /isolinux/memdisk
+  append initrd=/bootdisk/mhdd.img floppy
+
+label freedos
+  kernel /isolinux/memdisk
+  append initrd=/bootdisk/freedos.img floppy
+
+label seagate ST31000340NS update SN06
+  kernel /isolinux/memdisk
+  append initrd=/bootdisk/ES2SN06B.img floppy
+
+label thinkpad T4x 3.23 bios update
+  kernel /isolinux/memdisk
+  append initrd=/bootdisk/thinkpad_bios_3_23.img floppy
+
+label western digital wdidle3
+  kernel /isolinux/memdisk
+  append initrd=/bootdisk/wdidle3.img floppy
+
+label ntpasswd
+  kernel /ntpasswd/vmlinuz
+  append rw vga=1 initrd=/ntpasswd/initrd.cgz,/ntpasswd/scsi.cgz
+
+#  kernel kernel/current
+#  append rootfstype=nfs root=/dev/nfs ro nfsroot=10.144.1.1:/exports/node,v3,rsize=16384,wsize=16384 ip=dhcp panic=5 panic_on_oops=1 quiet vga=0x317
+
+
